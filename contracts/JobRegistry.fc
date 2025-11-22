@@ -1,0 +1,262 @@
+;; WajoB Job Registry Smart Contract
+;; Based on TON Blueprint best practices
+;; Reference: https://docs.ton.org/develop/smart-contracts/
+
+#include "imports/stdlib.fc";
+
+;; ============= CONSTANTS =============
+
+;; Error codes (following TON standards)
+const int error::unauthorized = 401;
+const int error::job_not_found = 404;
+const int error::invalid_status = 400;
+const int error::invalid_data = 422;
+
+;; Job status enum
+const int status::open = 0;
+const int status::assigned = 1;
+const int status::in_progress = 2;
+const int status::completed = 3;
+const int status::cancelled = 4;
+const int status::disputed = 5;
+
+;; Operation codes (following TON standards with 32-bit)
+const int op::create_job = 0x7362d09c;
+const int op::update_status = 0x5fcc3d14;
+const int op::assign_worker = 0x235caf52;
+const int op::cancel_job = 0x9a4b7c1d;
+
+;; ============= STORAGE =============
+
+;; Storage layout (optimized for gas):
+;; job_count | jobs_dict | owner_address
+
+global int storage::job_count;
+global cell storage::jobs;
+global slice storage::owner;
+
+;; Load storage from c4
+() load_storage() impure inline {
+    slice ds = get_data().begin_parse();
+    
+    storage::job_count = ds~load_uint(64);
+    storage::jobs = ds~load_dict();
+    storage::owner = ds~load_msg_addr();
+}
+
+;; Save storage to c4
+() save_storage() impure inline {
+    set_data(
+        begin_cell()
+            .store_uint(storage::job_count, 64)
+            .store_dict(storage::jobs)
+            .store_slice(storage::owner)
+        .end_cell()
+    );
+}
+
+;; ============= JOB DATA STRUCTURE =============
+
+;; Pack job data into optimized cell structure
+;; Following TON's cell size limits (1023 bits per cell)
+cell pack_job(
+    int job_id,
+    slice employer,
+    slice worker,
+    int wages,
+    int status,
+    int created_at,
+    cell metadata
+) inline {
+    return begin_cell()
+        .store_uint(job_id, 64)
+        .store_slice(employer)
+        .store_slice(worker)
+        .store_coins(wages)
+        .store_uint(status, 8)
+        .store_uint(created_at, 64)
+        .store_ref(metadata)  ;; title, description, location in ref
+    .end_cell();
+}
+
+;; Unpack job data
+(int, slice, slice, int, int, int, cell) unpack_job(slice ds) inline {
+    return (
+        ds~load_uint(64),      ;; job_id
+        ds~load_msg_addr(),    ;; employer
+        ds~load_msg_addr(),    ;; worker
+        ds~load_coins(),       ;; wages
+        ds~load_uint(8),       ;; status
+        ds~load_uint(64),      ;; created_at
+        ds~load_ref()          ;; metadata
+    );
+}
+
+;; ============= OPERATIONS =============
+
+;; Create new job
+() op_create_job(slice sender, int wages, cell metadata) impure {
+    load_storage();
+    
+    ;; Increment job counter
+    storage::job_count += 1;
+    int job_id = storage::job_count;
+    
+    ;; Create empty worker address (addr_none)
+    slice no_worker = begin_cell().store_uint(0, 2).end_cell().begin_parse();
+    
+    ;; Pack and store job
+    cell job = pack_job(
+        job_id,
+        sender,
+        no_worker,
+        wages,
+        status::open,
+        now(),
+        metadata
+    );
+    
+    storage::jobs~udict_set(64, job_id, job.begin_parse());
+    
+    save_storage();
+    
+    ;; Send success response
+    send_raw_message(
+        begin_cell()
+            .store_uint(0x10, 6)  ;; nobounce
+            .store_slice(sender)
+            .store_coins(0)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_uint(op::create_job, 32)
+            .store_uint(job_id, 64)
+        .end_cell(),
+        64  ;; mode: send remaining value
+    );
+}
+
+;; Update job status
+() op_update_status(slice sender, int job_id, int new_status) impure {
+    load_storage();
+    
+    ;; Get job
+    (slice job_slice, int found?) = storage::jobs.udict_get?(64, job_id);
+    throw_unless(error::job_not_found, found?);
+    
+    ;; Unpack job
+    var (id, employer, worker, wages, old_status, created_at, metadata) = unpack_job(job_slice);
+    
+    ;; Check authorization
+    throw_unless(error::unauthorized, equal_slice_bits(sender, employer));
+    
+    ;; Validate status
+    throw_unless(error::invalid_status, 
+        (new_status >= status::open) & (new_status <= status::disputed));
+    
+    ;; Update job
+    cell updated_job = pack_job(
+        id, employer, worker, wages, new_status, created_at, metadata
+    );
+    
+    storage::jobs~udict_set(64, job_id, updated_job.begin_parse());
+    
+    save_storage();
+}
+
+;; Assign worker
+() op_assign_worker(slice sender, int job_id, slice new_worker) impure {
+    load_storage();
+    
+    (slice job_slice, int found?) = storage::jobs.udict_get?(64, job_id);
+    throw_unless(error::job_not_found, found?);
+    
+    var (id, employer, worker, wages, old_status, created_at, metadata) = unpack_job(job_slice);
+    
+    ;; Only employer can assign
+    throw_unless(error::unauthorized, equal_slice_bits(sender, employer));
+    
+    ;; Update with worker and set status to assigned
+    cell updated_job = pack_job(
+        id, employer, new_worker, wages, status::assigned, created_at, metadata
+    );
+    
+    storage::jobs~udict_set(64, job_id, updated_job.begin_parse());
+    
+    save_storage();
+}
+
+;; ============= MESSAGE RECEIVER =============
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    ;; Return if empty message
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+    
+    ;; Parse message
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    
+    ;; Ignore bounced messages
+    if (flags & 1) {
+        return ();
+    }
+    
+    slice sender = cs~load_msg_addr();
+    
+    int op = in_msg_body~load_uint(32);
+    
+    if (op == op::create_job) {
+        int wages = in_msg_body~load_coins();
+        cell metadata = in_msg_body~load_ref();
+        op_create_job(sender, wages, metadata);
+        return ();
+    }
+    
+    if (op == op::update_status) {
+        int job_id = in_msg_body~load_uint(64);
+        int new_status = in_msg_body~load_uint(8);
+        op_update_status(sender, job_id, new_status);
+        return ();
+    }
+    
+    if (op == op::assign_worker) {
+        int job_id = in_msg_body~load_uint(64);
+        slice worker = in_msg_body~load_msg_addr();
+        op_assign_worker(sender, job_id, worker);
+        return ();
+    }
+    
+    ;; Unknown operation
+    throw(0xffff);
+}
+
+;; ============= GET METHODS =============
+
+;; Get job by ID
+(int, slice, slice, int, int, int, cell) get_job(int job_id) method_id {
+    load_storage();
+    
+    (slice job_slice, int found?) = storage::jobs.udict_get?(64, job_id);
+    throw_unless(error::job_not_found, found?);
+    
+    return unpack_job(job_slice);
+}
+
+;; Get total job count
+int get_job_count() method_id {
+    load_storage();
+    return storage::job_count;
+}
+
+;; Get contract owner
+slice get_owner() method_id {
+    load_storage();
+    return storage::owner;
+}
+
+;; Check if job exists
+int job_exists(int job_id) method_id {
+    load_storage();
+    (slice job_slice, int found?) = storage::jobs.udict_get?(64, job_id);
+    return found?;
+}

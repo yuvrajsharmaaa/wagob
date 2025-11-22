@@ -1,0 +1,242 @@
+;; WajoB Reputation Smart Contract
+;; Based on TON best practices for immutable on-chain data
+;; Reference: https://docs.ton.org/develop/smart-contracts/guidelines
+
+#include "imports/stdlib.fc";
+
+;; ============= CONSTANTS =============
+
+const int error::unauthorized = 401;
+const int error::not_found = 404;
+const int error::already_rated = 409;
+const int error::invalid_rating = 400;
+
+;; Operations
+const int op::submit_rating = 0x9e6f2a84;
+const int op::get_reputation = 0x4d8b3c71;
+
+;; Rating constraints
+const int min_rating = 1;
+const int max_rating = 5;
+const int scale = 100;
+
+;; ============= STORAGE =============
+
+global int storage::rating_count;
+global cell storage::ratings;
+global cell storage::reputations;
+global cell storage::job_ratings;
+
+() load_storage() impure inline {
+    slice ds = get_data().begin_parse();
+    storage::rating_count = ds~load_uint(64);
+    storage::ratings = ds~load_dict();
+    storage::reputations = ds~load_dict();
+    storage::job_ratings = ds~load_dict();
+}
+
+() save_storage() impure inline {
+    set_data(
+        begin_cell()
+            .store_uint(storage::rating_count, 64)
+            .store_dict(storage::ratings)
+            .store_dict(storage::reputations)
+            .store_dict(storage::job_ratings)
+        .end_cell()
+    );
+}
+
+;; ============= DATA STRUCTURES =============
+
+cell pack_rating(
+    int rating_id,
+    int job_id,
+    slice rater,
+    slice ratee,
+    int score,
+    int created_at
+) inline {
+    return begin_cell()
+        .store_uint(rating_id, 64)
+        .store_uint(job_id, 64)
+        .store_slice(rater)
+        .store_slice(ratee)
+        .store_uint(score, 8)
+        .store_uint(created_at, 64)
+    .end_cell();
+}
+
+(int, int, slice, slice, int, int) unpack_rating(slice ds) inline {
+    
+    return (
+        ds~load_uint(64),    ;; rating_id
+        ds~load_uint(64),    ;; job_id
+        ds~load_msg_addr(),  ;; rater
+        ds~load_msg_addr(),  ;; ratee
+        ds~load_uint(8),     ;; score
+        ds~load_uint(64)     ;; created_at
+    );
+}
+
+cell pack_reputation(int total, int sum, int avg, int jobs) inline {
+    return begin_cell()
+        .store_uint(total, 32)
+        .store_uint(sum, 32)
+        .store_uint(avg, 16)
+        .store_uint(jobs, 32)
+    .end_cell();
+}
+
+(int, int, int, int) unpack_reputation(slice ds) inline {
+    
+    return (
+        ds~load_uint(32),  ;; total_ratings
+        ds~load_uint(32),  ;; sum_ratings
+        ds~load_uint(16),  ;; average
+        ds~load_uint(32)   ;; jobs_count
+    );
+}
+
+;; ============= OPERATIONS =============
+
+() op_submit_rating(
+    slice sender,
+    int job_id,
+    slice ratee,
+    int score
+) impure {
+    load_storage();
+    
+    ;; Validate score
+    throw_unless(error::invalid_rating, (score >= min_rating) & (score <= max_rating));
+    
+    ;; Check if already rated this job
+    int sender_hash = slice_hash(sender);
+    int job_key = job_id + sender_hash;  ;; Composite key
+    
+    (slice existing, int found?) = storage::job_ratings.udict_get?(256, job_key);
+    throw_if(error::already_rated, found?);
+    
+    ;; Create rating
+    storage::rating_count += 1;
+    int rating_id = storage::rating_count;
+    
+    cell rating = pack_rating(
+        rating_id, job_id, sender, ratee, score, now()
+    );
+    
+    storage::ratings~udict_set(64, rating_id, rating.begin_parse());
+    
+    ;; Mark job as rated by sender
+    storage::job_ratings~udict_set(256, job_key, 
+        begin_cell().store_uint(rating_id, 64).end_cell().begin_parse()
+    );
+    
+    ;; Update ratee's reputation
+    int ratee_hash = slice_hash(ratee);
+    (slice rep_slice, int rep_found?) = storage::reputations.udict_get?(256, ratee_hash);
+    
+    int total = 1;
+    int sum = score;
+    int avg = score * scale;
+    int jobs = 1;
+    
+    if (rep_found?) {
+        var (old_total, old_sum, old_avg, old_jobs) = unpack_reputation(rep_slice);
+        total = old_total + 1;
+        sum = old_sum + score;
+        jobs = old_jobs + 1;
+        avg = muldiv(sum, scale, total);
+    }
+    
+    cell new_rep = pack_reputation(total, sum, avg, jobs);
+    storage::reputations~udict_set(256, ratee_hash, new_rep.begin_parse());
+    
+    save_storage();
+    
+    ;; Notify ratee
+    send_raw_message(
+        begin_cell()
+            .store_uint(0x10, 6)
+            .store_slice(ratee)
+            .store_coins(0)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_uint(op::submit_rating, 32)
+            .store_uint(rating_id, 64)
+            .store_uint(score, 8)
+        .end_cell(),
+        64
+    );
+}
+
+;; ============= MESSAGE RECEIVER =============
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+    
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    
+    if (flags & 1) {
+        return ();
+    }
+    
+    slice sender = cs~load_msg_addr();
+    int op = in_msg_body~load_uint(32);
+    
+    if (op == op::submit_rating) {
+        int job_id = in_msg_body~load_uint(64);
+        slice ratee = in_msg_body~load_msg_addr();
+        int score = in_msg_body~load_uint(8);
+        op_submit_rating(sender, job_id, ratee, score);
+        return ();
+    }
+    
+    throw(0xffff);
+}
+
+;; ============= GET METHODS =============
+
+(int, int, int, int) get_reputation(slice user) method_id {
+    load_storage();
+    int user_hash = slice_hash(user);
+    (slice rep_slice, int found?) = storage::reputations.udict_get?(256, user_hash);
+    
+    if (~ found?) {
+        return (0, 0, 0, 0);
+    }
+    
+    return unpack_reputation(rep_slice);
+}
+
+(int, int, slice, slice, int, int) get_rating(int rating_id) method_id {
+    load_storage();
+    (slice rating_slice, int found?) = storage::ratings.udict_get?(64, rating_id);
+    throw_unless(error::not_found, found?);
+    return unpack_rating(rating_slice);
+}
+
+int get_rating_count() method_id {
+    load_storage();
+    return storage::rating_count;
+}
+
+int calculate_score(slice user) method_id {
+    load_storage();
+    int user_hash = slice_hash(user);
+    (slice rep_slice, int found?) = storage::reputations.udict_get?(256, user_hash);
+    
+    if (~ found?) {
+        return 0;
+    }
+    
+    var (total, sum, avg, jobs) = unpack_reputation(rep_slice);
+    
+    ;; 70% rating, 30% job count (capped at 10)
+    int rating_component = muldiv(avg, 70, 100);
+    int job_component = min(muldiv(jobs, 30 * scale, 10), 30 * scale);
+    
+    return muldiv(rating_component + job_component, 100, max_rating * scale);
+}

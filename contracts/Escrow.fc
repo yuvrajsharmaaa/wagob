@@ -1,0 +1,390 @@
+;; WajoB Escrow Smart Contract
+;; Based on TON Blueprint and official TON examples
+;; Reference: https://docs.ton.org/develop/smart-contracts/tutorials/wallet
+
+#include "imports/stdlib.fc";
+
+;; ============= CONSTANTS =============
+
+const int error::unauthorized = 401;
+const int error::not_found = 404;
+const int error::invalid_state = 400;
+const int error::insufficient_funds = 402;
+
+;; Escrow states
+const int state::created = 0;
+const int state::funded = 1;
+const int state::locked = 2;
+const int state::completed = 3;
+const int state::disputed = 4;
+const int state::refunded = 5;
+
+;; Operations
+const int op::create_escrow = 0x8f4a33db;
+const int op::fund = 0x2fcb26a8;
+const int op::lock = 0x5de7c0ab;
+const int op::confirm = 0x6a8d4f12;
+const int op::release = 0x3c9f8b2e;
+const int op::dispute = 0x7b3e5c91;
+const int op::resolve = 0x4f2a9d63;
+
+;; Fee: 2.5% in basis points
+const int fee_bps = 250;
+const int basis_points = 10000;
+
+;; ============= STORAGE =============
+
+global int storage::escrow_count;
+global cell storage::escrows;
+global slice storage::owner;
+
+() load_storage() impure inline {
+    slice ds = get_data().begin_parse();
+    storage::escrow_count = ds~load_uint(64);
+    storage::escrows = ds~load_dict();
+    storage::owner = ds~load_msg_addr();
+}
+
+() save_storage() impure inline {
+    set_data(
+        begin_cell()
+            .store_uint(storage::escrow_count, 64)
+            .store_dict(storage::escrows)
+            .store_slice(storage::owner)
+        .end_cell()
+    );
+}
+
+;; ============= ESCROW DATA =============
+
+cell pack_escrow(
+    int escrow_id,
+    int job_id,
+    slice employer,
+    slice worker,
+    int amount,
+    int state,
+    int created_at,
+    int employer_confirmed,
+    int worker_confirmed
+) inline {
+    return begin_cell()
+        .store_uint(escrow_id, 64)
+        .store_uint(job_id, 64)
+        .store_slice(employer)
+        .store_slice(worker)
+        .store_coins(amount)
+        .store_uint(state, 8)
+        .store_uint(created_at, 64)
+        .store_uint(employer_confirmed, 1)
+        .store_uint(worker_confirmed, 1)
+    .end_cell();
+}
+
+(int, int, slice, slice, int, int, int, int, int) unpack_escrow(slice ds) inline {
+    
+    return (
+        ds~load_uint(64),      ;; escrow_id
+        ds~load_uint(64),      ;; job_id
+        ds~load_msg_addr(),    ;; employer
+        ds~load_msg_addr(),    ;; worker
+        ds~load_coins(),       ;; amount
+        ds~load_uint(8),       ;; state
+        ds~load_uint(64),      ;; created_at
+        ds~load_uint(1),       ;; employer_confirmed
+        ds~load_uint(1)        ;; worker_confirmed
+    );
+}
+
+;; ============= OPERATIONS =============
+
+() op_create_escrow(slice sender, int job_id, slice worker, int amount) impure {
+    load_storage();
+    
+    storage::escrow_count += 1;
+    int escrow_id = storage::escrow_count;
+    
+    cell escrow = pack_escrow(
+        escrow_id, job_id, sender, worker, amount,
+        state::created, now(), 0, 0
+    );
+    
+    storage::escrows~udict_set(64, escrow_id, escrow.begin_parse());
+    save_storage();
+    
+    ;; Notify sender
+    send_raw_message(
+        begin_cell()
+            .store_uint(0x10, 6)
+            .store_slice(sender)
+            .store_coins(0)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_uint(op::create_escrow, 32)
+            .store_uint(escrow_id, 64)
+        .end_cell(),
+        64
+    );
+}
+
+() op_fund(slice sender, int escrow_id, int msg_value) impure {
+    load_storage();
+    
+    (slice escrow_slice, int found?) = storage::escrows.udict_get?(64, escrow_id);
+    throw_unless(error::not_found, found?);
+    
+    var (id, job_id, employer, worker, amount, old_state, created_at, emp_conf, work_conf) = 
+        unpack_escrow(escrow_slice);
+    
+    throw_unless(error::unauthorized, equal_slice_bits(sender, employer));
+    throw_unless(error::invalid_state, old_state == state::created);
+    throw_unless(error::insufficient_funds, msg_value >= amount);
+    
+    ;; Update state to funded
+    cell updated = pack_escrow(
+        id, job_id, employer, worker, amount,
+        state::funded, created_at, emp_conf, work_conf
+    );
+    
+    storage::escrows~udict_set(64, escrow_id, updated.begin_parse());
+    save_storage();
+    
+    ;; Notify worker
+    send_raw_message(
+        begin_cell()
+            .store_uint(0x10, 6)
+            .store_slice(worker)
+            .store_coins(0)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_uint(op::fund, 32)
+            .store_uint(escrow_id, 64)
+        .end_cell(),
+        64
+    );
+}
+
+() op_lock(slice sender, int escrow_id) impure {
+    load_storage();
+    
+    (slice escrow_slice, int found?) = storage::escrows.udict_get?(64, escrow_id);
+    throw_unless(error::not_found, found?);
+    
+    var (id, job_id, employer, worker, amount, old_state, created_at, emp_conf, work_conf) = 
+        unpack_escrow(escrow_slice);
+    
+    throw_unless(error::unauthorized, equal_slice_bits(sender, worker));
+    throw_unless(error::invalid_state, old_state == state::funded);
+    
+    cell updated = pack_escrow(
+        id, job_id, employer, worker, amount,
+        state::locked, created_at, emp_conf, work_conf
+    );
+    
+    storage::escrows~udict_set(64, escrow_id, updated.begin_parse());
+    save_storage();
+}
+
+() op_confirm(slice sender, int escrow_id) impure {
+    load_storage();
+    
+    (slice escrow_slice, int found?) = storage::escrows.udict_get?(64, escrow_id);
+    throw_unless(error::not_found, found?);
+    
+    var (id, job_id, employer, worker, amount, old_state, created_at, emp_conf, work_conf) = 
+        unpack_escrow(escrow_slice);
+    
+    throw_unless(error::invalid_state, old_state == state::locked);
+    
+    ;; Update confirmation
+    if (equal_slice_bits(sender, employer)) {
+        emp_conf = 1;
+    }
+    if (equal_slice_bits(sender, worker)) {
+        work_conf = 1;
+    }
+    
+    ;; If both confirmed, release payment
+    if (emp_conf & work_conf) {
+        int fee = muldiv(amount, fee_bps, basis_points);
+        int worker_payment = amount - fee;
+        
+        ;; Send to worker
+        send_raw_message(
+            begin_cell()
+                .store_uint(0x10, 6)
+                .store_slice(worker)
+                .store_coins(worker_payment)
+                .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                .store_uint(op::release, 32)
+            .end_cell(),
+            1  ;; pay fees separately
+        );
+        
+        ;; Send fee to platform
+        send_raw_message(
+            begin_cell()
+                .store_uint(0x10, 6)
+                .store_slice(storage::owner)
+                .store_coins(fee)
+                .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .end_cell(),
+            1
+        );
+        
+        cell updated = pack_escrow(
+            id, job_id, employer, worker, amount,
+            state::completed, created_at, emp_conf, work_conf
+        );
+        
+        storage::escrows~udict_set(64, escrow_id, updated.begin_parse());
+    } else {
+        ;; Just update confirmations
+        cell updated = pack_escrow(
+            id, job_id, employer, worker, amount,
+            old_state, created_at, emp_conf, work_conf
+        );
+        
+        storage::escrows~udict_set(64, escrow_id, updated.begin_parse());
+    }
+    
+    save_storage();
+}
+
+() op_dispute(slice sender, int escrow_id) impure {
+    load_storage();
+    
+    (slice escrow_slice, int found?) = storage::escrows.udict_get?(64, escrow_id);
+    throw_unless(error::not_found, found?);
+    
+    var (id, job_id, employer, worker, amount, old_state, created_at, emp_conf, work_conf) = 
+        unpack_escrow(escrow_slice);
+    
+    int is_party = equal_slice_bits(sender, employer) | equal_slice_bits(sender, worker);
+    throw_unless(error::unauthorized, is_party);
+    throw_unless(error::invalid_state, old_state == state::locked);
+    
+    cell updated = pack_escrow(
+        id, job_id, employer, worker, amount,
+        state::disputed, created_at, emp_conf, work_conf
+    );
+    
+    storage::escrows~udict_set(64, escrow_id, updated.begin_parse());
+    save_storage();
+}
+
+() op_resolve(slice sender, int escrow_id, int to_worker) impure {
+    load_storage();
+    
+    throw_unless(error::unauthorized, equal_slice_bits(sender, storage::owner));
+    
+    (slice escrow_slice, int found?) = storage::escrows.udict_get?(64, escrow_id);
+    throw_unless(error::not_found, found?);
+    
+    var (id, job_id, employer, worker, amount, old_state, created_at, emp_conf, work_conf) = 
+        unpack_escrow(escrow_slice);
+    
+    throw_unless(error::invalid_state, old_state == state::disputed);
+    
+    if (to_worker) {
+        int fee = muldiv(amount, fee_bps, basis_points);
+        int worker_payment = amount - fee;
+        
+        send_raw_message(
+            begin_cell()
+                .store_uint(0x10, 6)
+                .store_slice(worker)
+                .store_coins(worker_payment)
+                .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .end_cell(),
+            1
+        );
+    } else {
+        send_raw_message(
+            begin_cell()
+                .store_uint(0x10, 6)
+                .store_slice(employer)
+                .store_coins(amount)
+                .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .end_cell(),
+            1
+        );
+    }
+    
+    save_storage();
+}
+
+;; ============= MESSAGE RECEIVER =============
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+    
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    
+    if (flags & 1) {
+        return ();  ;; ignore bounced
+    }
+    
+    slice sender = cs~load_msg_addr();
+    int op = in_msg_body~load_uint(32);
+    
+    if (op == op::create_escrow) {
+        int job_id = in_msg_body~load_uint(64);
+        slice worker = in_msg_body~load_msg_addr();
+        int amount = in_msg_body~load_coins();
+        op_create_escrow(sender, job_id, worker, amount);
+        return ();
+    }
+    
+    if (op == op::fund) {
+        int escrow_id = in_msg_body~load_uint(64);
+        op_fund(sender, escrow_id, msg_value);
+        return ();
+    }
+    
+    if (op == op::lock) {
+        int escrow_id = in_msg_body~load_uint(64);
+        op_lock(sender, escrow_id);
+        return ();
+    }
+    
+    if (op == op::confirm) {
+        int escrow_id = in_msg_body~load_uint(64);
+        op_confirm(sender, escrow_id);
+        return ();
+    }
+    
+    if (op == op::dispute) {
+        int escrow_id = in_msg_body~load_uint(64);
+        op_dispute(sender, escrow_id);
+        return ();
+    }
+    
+    if (op == op::resolve) {
+        int escrow_id = in_msg_body~load_uint(64);
+        int to_worker = in_msg_body~load_uint(1);
+        op_resolve(sender, escrow_id, to_worker);
+        return ();
+    }
+    
+    throw(0xffff);
+}
+
+;; ============= GET METHODS =============
+
+(int, int, slice, slice, int, int, int, int, int) get_escrow(int escrow_id) method_id {
+    load_storage();
+    (slice escrow_slice, int found?) = storage::escrows.udict_get?(64, escrow_id);
+    throw_unless(error::not_found, found?);
+    return unpack_escrow(escrow_slice);
+}
+
+int get_escrow_count() method_id {
+    load_storage();
+    return storage::escrow_count;
+}
+
+int get_fee_bps() method_id {
+    return fee_bps;
+}
