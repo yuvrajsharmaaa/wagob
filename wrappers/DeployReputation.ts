@@ -1,16 +1,26 @@
 import { Address, beginCell, Cell, Contract, contractAddress, ContractProvider, Sender, SendMode } from '@ton/core';
 
 export type ReputationConfig = {
-    owner: Address;
+    owner?: Address;
+    id?: number;
+    counter?: number;
 };
 
 export function reputationConfigToCell(config: ReputationConfig): Cell {
+    // Simple config for testing - just stores counter
+    if (config.id !== undefined || config.counter !== undefined) {
+        return beginCell()
+            .storeUint(config.counter || config.id || 0, 64)
+            .endCell();
+    }
+    
+    // Full config for production
     return beginCell()
         .storeUint(0, 64) // rating_count = 0
         .storeDict(null) // empty ratings dictionary
         .storeDict(null) // empty reputations dictionary
         .storeDict(null) // empty job_ratings dictionary
-        .storeAddress(config.owner) // owner address
+        .storeAddress(config.owner!) // owner address
         .endCell();
 }
 
@@ -93,6 +103,30 @@ export class DeployReputation implements Contract {
 
     async calculateScore(provider: ContractProvider, user: Address): Promise<number> {
         const result = await provider.get('calculate_score', [{ type: 'slice', cell: beginCell().storeAddress(user).endCell() }]);
+        return result.stack.readNumber();
+    }
+
+    async sendIncrease(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            increaseBy: number;
+            value: bigint;
+        }
+    ) {
+        await provider.internal(via, {
+            value: opts.value,
+            sendMode: SendMode.PAY_GAS_SEPARATELY,
+            body: beginCell()
+                .storeUint(0x7e8764ef, 32) // op::increase
+                .storeUint(0, 64) // query_id
+                .storeUint(opts.increaseBy, 32)
+                .endCell(),
+        });
+    }
+
+    async getCounter(provider: ContractProvider): Promise<number> {
+        const result = await provider.get('get_counter', []);
         return result.stack.readNumber();
     }
 }

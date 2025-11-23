@@ -103,9 +103,53 @@ export class DeployJobRegistry implements Contract {
         });
     }
 
+    async sendAcceptJob(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint;
+            jobId: bigint;
+        }
+    ) {
+        await provider.internal(via, {
+            value: opts.value,
+            sendMode: SendMode.PAY_GAS_SEPARATELY,
+            body: beginCell()
+                .storeUint(Opcodes.assign_worker, 32)
+                .storeUint(0, 64) // query_id
+                .storeUint(opts.jobId, 64)
+                .storeAddress(via.address!)
+                .endCell(),
+        });
+    }
+
+    async sendCompleteJob(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint;
+            jobId: bigint;
+        }
+    ) {
+        await provider.internal(via, {
+            value: opts.value,
+            sendMode: SendMode.PAY_GAS_SEPARATELY,
+            body: beginCell()
+                .storeUint(Opcodes.update_status, 32)
+                .storeUint(0, 64) // query_id
+                .storeUint(opts.jobId, 64)
+                .storeUint(3, 8) // COMPLETED status
+                .endCell(),
+        });
+    }
+
     async getJobCount(provider: ContractProvider): Promise<bigint> {
         const result = await provider.get('get_job_count', []);
         return result.stack.readBigNumber();
+    }
+
+    async getJobData(provider: ContractProvider, jobId: number | bigint) {
+        return this.getJob(provider, BigInt(jobId));
     }
 
     async getJob(provider: ContractProvider, jobId: bigint) {

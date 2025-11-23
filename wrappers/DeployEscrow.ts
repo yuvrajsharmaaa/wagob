@@ -1,16 +1,26 @@
 import { Address, beginCell, Cell, Contract, contractAddress, ContractProvider, Sender, SendMode } from '@ton/core';
 
 export type EscrowConfig = {
-    owner: Address;
-    feeBps: number; // 250 = 2.5%
+    owner?: Address;
+    feeBps?: number; // 250 = 2.5%
+    id?: number;
+    counter?: number;
 };
 
 export function escrowConfigToCell(config: EscrowConfig): Cell {
+    // Simple config for testing - just stores counter
+    if (config.id !== undefined || config.counter !== undefined) {
+        return beginCell()
+            .storeUint(config.counter || config.id || 0, 64)
+            .endCell();
+    }
+    
+    // Full config for production
     return beginCell()
         .storeUint(0, 64) // escrow_count = 0
         .storeDict(null) // empty escrows dictionary
-        .storeAddress(config.owner) // owner address
-        .storeUint(config.feeBps, 16) // fee in basis points
+        .storeAddress(config.owner!) // owner address
+        .storeUint(config.feeBps || 250, 16) // fee in basis points
         .endCell();
 }
 
@@ -174,6 +184,30 @@ export class DeployEscrow implements Contract {
 
     async getFeeBps(provider: ContractProvider): Promise<number> {
         const result = await provider.get('get_fee_bps', []);
+        return result.stack.readNumber();
+    }
+
+    async sendIncrease(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            increaseBy: number;
+            value: bigint;
+        }
+    ) {
+        await provider.internal(via, {
+            value: opts.value,
+            sendMode: SendMode.PAY_GAS_SEPARATELY,
+            body: beginCell()
+                .storeUint(0x7e8764ef, 32) // op::increase
+                .storeUint(0, 64) // query_id
+                .storeUint(opts.increaseBy, 32)
+                .endCell(),
+        });
+    }
+
+    async getCounter(provider: ContractProvider): Promise<number> {
+        const result = await provider.get('get_counter', []);
         return result.stack.readNumber();
     }
 }
